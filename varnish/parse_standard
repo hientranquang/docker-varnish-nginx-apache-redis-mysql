@@ -1,0 +1,91 @@
+#!/bin/bash
+
+################################################################
+# 
+# Apache License 2.0
+#
+# This file will parse the Environment variables created by
+# node containers linked to the varnish container
+# and automatically create a default.vcl configuration file
+# 
+# The configuration file will create a load balancer and add
+# each of the node containers linked.
+#
+# Varnish is not configured to use the reverse proxy features
+# that it has, it just a load balancer.
+#
+################################################################
+
+
+# Get the Environment variables and save them in the variable envs
+envs=`printenv`
+
+# Remove the default.vcl file
+
+echo "vcl 4.0;" > /etc/varnish/default.vcl
+# Loop through all of our variables
+for env in $envs
+do
+  # separate the name of the variable from the value
+  IFS== read name value <<< "$env"  
+  
+  # if the variable has PORT_80_TCP_ADDR it means this is a
+  # variable created by a node container linked to the varnish
+  # container
+  if [[ $name == *PORT_80_TCP_ADDR* ]]; then
+  #read IP link from container
+    read realIp <<<  $(getent hosts ${value} | awk '{ print $1 }' );  
+# create a backend for each node container found in the variables
+cat >> /etc/varnish/default.vcl << EOF
+  backend ${name} {
+    .host = "${realIp}";
+    .port = "80";
+    .connect_timeout = 5s;
+    .first_byte_timeout = 5s;
+    .between_bytes_timeout = 5s;
+    
+    
+  }
+  
+EOF
+
+  fi
+done
+
+# once we have all the containers ready, we create the
+# load balancer, since we're gonna loop again, we just
+# create the first line
+cat >> /etc/varnish/default.vcl << EOF
+
+  import directors; 
+  sub vcl_init {
+    #new cluster1 = directors.round_robin();
+    new hash = directors.hash();
+EOF
+
+# loop again to add each backend created
+for env in $envs
+do
+  IFS== read name value <<< "$env"  
+  if [[ $name == *PORT_80_TCP_ADDR* ]]; then
+
+# create each backend in the load balancer
+cat >> /etc/varnish/default.vcl << EOF     
+     #cluster1.add_backend(${name});
+     hash.add_backend(${name}, 3);
+EOF
+
+  fi
+done
+
+# close the load balancer line
+# and add the balancer as the req.backend
+cat >> /etc/varnish/default.vcl << EOF
+
+  }
+ 
+sub vcl_recv {
+    #set req.backend_hint = cluster1.backend();
+    set req.backend_hint = hash.backend(req.url);
+}
+EOF
